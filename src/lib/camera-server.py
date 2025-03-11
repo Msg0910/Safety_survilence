@@ -26,37 +26,62 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_google_genai import ChatGoogleGenerativeAI
+import queue
+from functools import lru_cache
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="mediapipe")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}},
      allow_headers=["Content-Type", "Authorization"],
      supports_credentials=True)
 
-
-
-
-
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-app = Flask(__name__)
-CORS(app)
 
 # Initialize Supabase client with environment variables
 supabase_url = os.getenv("VITE_SUPABASE_URL")
 supabase_key = os.getenv("VITE_SUPABASE_ANON_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-
 # Initialize MediaPipe Hands for gesture detection
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands()
+hands_processor = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    model_complexity=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
 
 # Global state to track active models
 active_models = {}
+
+def fix_base64_padding(encoded_str: str) -> str:
+    """Add padding to base64 string if needed."""
+    padding = len(encoded_str) % 4
+    if padding:
+        encoded_str += '=' * (4 - padding)
+    return encoded_str
+
+def safe_base64_decode(encoded_str: str) -> bytes:
+    """Safely decode base64 string with padding correction."""
+    try:
+        # First try direct decoding
+        return base64.b64decode(encoded_str)
+    except Exception:
+        try:
+            # Try with padding correction
+            padded_str = fix_base64_padding(encoded_str)
+            return base64.b64decode(padded_str)
+        except Exception as e:
+            logger.error(f"Failed to decode base64 string: {str(e)}")
+            raise
+
 class Assistant:
     def __init__(self):
         self.fire_model = self._initialize_model(os.getenv("GOOGLE_API_KEY_FIRE"))
@@ -126,20 +151,19 @@ class Assistant:
 # Initialize the assistant globally
 assistant = Assistant()
 
-
 class CameraManager:
     def __init__(self):
         self.cameras: Dict[str, cv2.VideoCapture] = {}
         self.locks: Dict[str, threading.Lock] = {}
+        self.frame_queues: Dict[str, queue.Queue] = {}  # Frame buffering
 
     def get_camera(self, camera_id: str, rtsp_url: str) -> cv2.VideoCapture:
         if camera_id not in self.cameras:
             cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-                cap.open(rtsp_url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size
             self.cameras[camera_id] = cap
             self.locks[camera_id] = threading.Lock()
+            self.frame_queues[camera_id] = queue.Queue(maxsize=2)  # Prevent backlog
         return self.cameras[camera_id]
 
     def release_camera(self, camera_id: str):
@@ -210,7 +234,6 @@ def capture_frame(camera_id):
 def health_check():
     return {'status': 'healthy'}
 
-
 @app.route('/generate_face_encoding', methods=['POST'])
 def generate_face_encoding():
     if 'image' not in request.files:
@@ -223,177 +246,254 @@ def generate_face_encoding():
     if not face_encodings:
         return jsonify({'error': 'No face detected'}), 400
 
-    # Serialize the face encoding using pickle
     face_encoding = face_encodings[0]
+    # Ensure proper padding in base64 encoding
     serialized_encoding = base64.b64encode(pickle.dumps(face_encoding)).decode('utf-8')
-
+    
     return jsonify({
         'face_encoding': serialized_encoding,
         'message': 'Face encoding generated successfully'
     })
-    
+
 
 @app.route('/model-control', methods=['POST'])
 def handle_model_control():
     try:
         data = request.get_json()
-        app.logger.info(f"Received request data: {data}")
-
-        camera_id = data.get('camera_id')
-        model_id = data.get('model_id')
-        action = data.get('action')
-
-        if not all([camera_id, model_id, action]):
-            app.logger.error("Missing parameters in request")
-            return jsonify({'error': 'Missing parameters'}), 400
-
+        camera_id = data['camera_id']
+        model_id = data['model_id']
+        action = data['action']
         if action == 'start':
             if camera_id in active_models:
-                app.logger.error("Model already running")
                 return jsonify({'error': 'Model already running'}), 400
+                
+            # Warm-up frame capture
+            rtsp_url = get_rtsp_url(camera_id)
+            test_cap = cv2.VideoCapture(rtsp_url)
+            if not test_cap.isOpened():
+                return jsonify({'error': 'Camera unreachable'}), 500
+            test_cap.release()
 
             active_models[camera_id] = {'running': True}
-            thread = threading.Thread(
+            threading.Thread(
                 target=run_model_inference,
-                args=(camera_id, model_id)
-            )
-            thread.start()
-            app.logger.info(f"Started model {model_id} on camera {camera_id}")
+                args=(camera_id, model_id),
+                daemon=True
+            ).start()
 
         elif action == 'stop':
-            if camera_id in active_models:
-                active_models[camera_id]['running'] = False
-                del active_models[camera_id]
-                app.logger.info(f"Stopped model {model_id} on camera {camera_id}")
-            else:
-                app.logger.error("Model was not running")
-                return jsonify({'error': 'Model was not running'}), 400
-        else:
-            app.logger.error("Invalid action")
-            return jsonify({'error': 'Invalid action'}), 400
+            active_models.pop(camera_id, None)
 
-        response = jsonify({
-            'status': 'success',
-            'camera_id': camera_id,
-            'model_id': model_id,
-            'action': action
-        })
-        response.headers.add('Access-Control-Allow-Origin', 'http://localhost:5173')
-        return response
-
+        return jsonify({'status': 'success'})
+    
     except Exception as e:
-        app.logger.error(f"Internal Server Error: {e}", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
-    
-    
+        logger.error(f"Model control error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 def get_model_details(model_id: str) -> dict:
-    """
-    Fetch model details from the database using the model_id.
-    Returns a dictionary containing model details.
-    """
     try:
-        # Fetch model details from the 'models' table in Supabase
         response = supabase.table('models').select('*').eq('model_id', model_id).execute()
         
         if response.data and len(response.data) > 0:
-            return response.data[0]  # Return the first matching model
+            return response.data[0]
         else:
             app.logger.error(f"No model found with ID: {model_id}")
             return {'error': 'Model not found'}
-        
-    
     except Exception as e:
         app.logger.error(f"Error fetching model details: {e}")
         return {'error': str(e)}
-    
 
 def run_model_inference(camera_id, model_id):
     rtsp_url = get_rtsp_url(camera_id)
     cap = cv2.VideoCapture(rtsp_url)
     
+    model_details = get_model_details(model_id)
+    if not model_details or 'error' in model_details:
+        app.logger.error(f"Failed to get model details for {model_id}")
+        return
+    
     while active_models.get(camera_id, {}).get('running', False):
         ret, frame = cap.read()
-        if not ret: continue
+        if not ret:
+            continue
         
-        # Model-specific processing
-        model = get_model_details(model_id)  # Implement model details fetch
-        if model['type'] == 'fire':
-            process_fire_model(frame, camera_id)
-        elif model['type'] == 'helmet':
+        # Process based on model type
+        if model_details['type'] == 'helmet':
             process_helmet_model(frame, camera_id)
+        elif model_details['type'] == 'fire':
+            process_fire_model(frame, camera_id)
+        elif model_details['type'] == 'attendance':
+            process_attendance(frame, camera_id)
     
     cap.release()
 
-def process_fire_model(frame, camera_id):
-    encoded_frame = base64.b64encode(cv2.imencode('.jpg', frame)[1]).decode()
-    response = assistant.answer(encoded_frame, 
-         "You are a fire detection assistant. Analyze the provided image to determine if there is any fire. Respond with 'Fire' or 'No Fire'.",
-    "fire" 
+def process_helmet_model(frame, camera_id):
+    _, buffer = cv2.imencode('.jpg', frame)
+    encoded_frame = base64.b64encode(buffer).decode()
+    
+    response = assistant.answer(
+        encoded_frame,
+        "Detect if a person is wearing a helmet. Respond with 'Helmet detected' or 'No helmet detected'.",
+        "helmet"
     )
-    detected = 'Fire' in response if response else 'No Fire'
+    
+    detected = response if response else 'No helmet detected'
+    app.logger.info(f"Camera {camera_id}: {detected}")
+    
+    # Insert detection result into Supabase
+    supabase.table('helmet_violations').insert({
+        'camera_id': camera_id,
+        'detected': detected,
+        'created_at': datetime.now().isoformat()
+    }).execute()
+
+def process_fire_model(frame, camera_id):
+    _, buffer = cv2.imencode('.jpg', frame)
+    encoded_frame = base64.b64encode(buffer).decode()
+    
+    response = assistant.answer(
+        encoded_frame,
+        "Detect if there is a fire. Respond with 'Fire detected' or 'No fire detected'.",
+        "fire"
+    )
+    
+    detected = response if response else 'No fire detected'
+    app.logger.info(f"Camera {camera_id}: {detected}")
+    
+    # Insert detection result into Supabase
     supabase.table('fire_detections').insert({
         'camera_id': camera_id,
         'detected': detected,
-        'confidence': 0.95 if detected == 'Fire' else 0.05
+        'created_at': datetime.now().isoformat()
     }).execute()
 
+# MODIFIED process_attendance FUNCTION
+def process_attendance(frame, camera_id):
+    # Frame skipping initialization
+    if not hasattr(process_attendance, "frame_counter"):
+        process_attendance.frame_counter = 0
+    process_attendance.frame_counter += 1
+    if process_attendance.frame_counter % 5 != 0:  # Process every 5th frame
+        return
 
-def process_helmet_model(frame, camera_id):
-    encoded_frame = base64.b64encode(cv2.imencode('.jpg', frame)[1]).decode()
-    response = assistant.answer(encoded_frame,
-       "Detect if a person is wearing a helmet. Respond with 'Helmet' or 'No Helmet'. Do not detect if the person is wearing a helmet in a photo or video. Do not respond with any other text.", "helmet"
-    )
-    detected = 'Helmet detected' in response if response else 'No helmet detected'
-    supabase.table('helmet_violations').insert({
-        'camera_id': camera_id,
-        'detected': detected
-    }).execute()
+    # Employee data caching
+    if not hasattr(process_attendance, "employee_cache"):
+        employees_response = supabase.table('employees').select('*').execute()
+        process_attendance.employee_cache = [
+            {**emp, "face_encoding": pickle.loads(safe_base64_decode(emp['face_encoding']))}
+            for emp in employees_response.data
+        ] if employees_response.data else []
+        logger.info("Preloaded employee encodings")
 
-def process_attendance_model(frame, camera_id):
-    # Face recognition logic
-    face_locations = face_recognition.face_locations(frame)
-    face_encodings = face_recognition.face_encodings(frame, face_locations)
+    # Convert frame and get dimensions
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_height, frame_width, _ = rgb_frame.shape
+
+    # Face detection
+    face_locations = face_recognition.face_locations(rgb_frame, model="hog")
+    if not face_locations:
+        return
+
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
     
-    for encoding in face_encodings:
-        employees = supabase.table('employees').select('*').execute()
-        for emp in employees.data:
-            stored_encoding = pickle.loads(base64.b64decode(emp['face_encoding']))
-            match = face_recognition.compare_faces([stored_encoding], encoding)
-            if match[0]:
-                app.logger.info(f"{emp['name']} detected in camera {camera_id}")
-                
-    # Gesture detection
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands()
-    mp_drawing = mp.solutions.drawing_utils
-    results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    if results.multi_hand_landmarks:
-        for hand in results.multi_hand_landmarks:
-            # Add gesture detection logic here
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_frame)
+    # Employee matching
+    for face_encoding in face_encodings:
+        similarities = face_recognition.face_distance(
+            [e["face_encoding"] for e in process_attendance.employee_cache], 
+            face_encoding
+        )
+        best_match_idx = np.argmin(similarities)
+        
+        if similarities[best_match_idx] < 0.55:
+            employee = process_attendance.employee_cache[best_match_idx]
+            logger.info(f"Matched employee: {employee['name']}")
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            # Hand detection with MediaPipe
+            # Configure MediaPipe Hands with image dimensions
+            hands = mp_hands.Hands(
+                static_image_mode=True,  # Set to True for better accuracy
+                max_num_hands=2,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.5,
+                model_complexity=1
+            )
 
-            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            # Process the frame
+            results = hands.process(rgb_frame)
+            
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Get specific landmarks for gesture detection
+                    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+                    thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+                    thumb_ip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP]
+                    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                    index_pip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP]
+                    
+                    # Calculate angles and distances for more accurate gesture detection
+                    thumb_angle = calculate_angle(
+                        (wrist.x, wrist.y),
+                        (thumb_ip.x, thumb_ip.y),
+                        (thumb_tip.x, thumb_tip.y)
+                    )
+                    
+                    index_angle = calculate_angle(
+                        (wrist.x, wrist.y),
+                        (index_pip.x, index_pip.y),
+                        (index_tip.x, index_tip.y)
+                    )
+                    
+                    # Determine gesture based on angles
+                    if thumb_angle > 150 and thumb_tip.y < wrist.y:  # Thumb is pointing up
+                        gesture = "thumb_up"
+                    else:
+                        gesture = "thumb_down"
+                    
+                    try:
+                        # Log the attendance with the detected gesture
+                        supabase.table('attendance_logs').insert({
+                            'employee_id': employee['employee_id'],
+                            'camera_id': camera_id,
+                            'gesture_detected': gesture,
+                            'timestamp': datetime.now().isoformat()
+                        }).execute()
+                        logger.info(f"Attendance logged: {employee['name']} - {gesture}")
+                    except Exception as e:
+                        logger.error(f"Database error for employee {employee['name']}: {str(e)}")
+            
+            # Clean up MediaPipe resources
+            hands.close()
 
-            if thumb_tip.y < index_tip.y:
-                return "thumb_up"
-            else:
-                return "thumb_down"
-    return None
-    pass
+def calculate_angle(p1, p2, p3):
+    """
+    Calculate the angle between three points
+    """
+    import math
+    
+    # Calculate vectors
+    v1 = (p2[0] - p1[0], p2[1] - p1[1])
+    v2 = (p3[0] - p2[0], p3[1] - p2[1])
+    
+    # Calculate angle in degrees
+    dot_product = v1[0] * v2[0] + v1[1] * v2[1]
+    magnitudes = math.sqrt((v1[0]**2 + v1[1]**2) * (v2[0]**2 + v2[1]**2))
+    
+    if magnitudes == 0:
+        return 0
+        
+    cos_angle = max(min(dot_product / magnitudes, 1), -1)
+    angle_rad = math.acos(cos_angle)
+    angle_deg = math.degrees(angle_rad)
+    
+    return angle_deg
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
 
-@app.errorhandler(500)
-def server_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+
+# Add cleanup handler
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    hands_processor.close()
+    logger.info("Cleaned up MediaPipe resources")
+    return jsonify({'status': 'shutting down'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)

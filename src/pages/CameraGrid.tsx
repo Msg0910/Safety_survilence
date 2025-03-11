@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Maximize2, Minimize2, Trash2 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import toast from 'react-hot-toast';
@@ -8,14 +8,31 @@ interface Model {
   name: string;
   type: string;
 }
-interface FireDetection {
-  detected: string;
+
+interface Camera {
   camera_id: string;
+  name: string;
+  rtsp_url: string;
+  location: string;
+}
+
+interface AttendanceLog {
+  log_id: string;
+  employee_id: string;
+  camera_id: string;
+  timestamp: string;
+  gesture_detected: string;
+}
+
+interface FireDetectionLog {
+  camera_id: string;
+  detected: string;
   created_at: string;
 }
-interface HelmetViolation {
-  detected: string;
+
+interface HelmetViolationLog {
   camera_id: string;
+  detected: string;
   created_at: string;
 }
 
@@ -24,123 +41,97 @@ function CameraGrid() {
   const [selectedCamera, setSelectedCamera] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [cameras, setCameras] = useState<Camera[]>([]);
+  const [fullscreenCamera, setFullscreenCamera] = useState<string | null>(null);
+  const camerasRef = useRef<Camera[]>([]);
+
+  // Keep cameras ref updated
+  useEffect(() => {
+    camerasRef.current = cameras;
+  }, [cameras]);
 
   useEffect(() => {
-    fetchModels();
-  }, []);
+    const fetchDataAndSubscribe = async () => {
+      await fetchModels();
+      await fetchCameras();
 
-  useEffect(() => {
-    const channel = supabase
-      .channel('detections')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'fire_detections' },
-        (payload) => {
-          console.log("🔥 Fire detection update received:", payload);
-          const detection = payload.new as FireDetection;
-          toast[detection.detected === 'Fire' ? 'error' : 'success'](
-            detection.detected === 'Fire'
-              ? `🔥 Fire detected in camera ${detection.camera_id}!`
-              : `✅ No fire in camera ${detection.camera_id}`,
-            {
-              icon: detection.detected === 'Fire' ? '🔥' : '✅',
-              position: 'bottom-right',
-            }
-          );
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'helmet_violations' },
-        (payload) => {
-          console.log("⛑️ Helmet violation update received:", payload);
-          const violation = payload.new as HelmetViolation;
-          toast[violation.detected === 'Helmet detected' ? 'success' : 'error'](
-            violation.detected === 'Helmet detected'
-              ? `✅ Helmet detected in camera ${violation.camera_id}`
-              : `⛑️ No helmet detected in camera ${violation.camera_id}!`,
-            {
-              icon: violation.detected === 'Helmet detected' ? '✅' : '⛑️',
-              position: 'bottom-right',
-            }
-          );
-        }
-      )
-      .subscribe();
-  
-    return () => {
-      supabase.removeChannel(channel);
+      const channel = supabase
+        .channel('detections')
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'attendance_logs' },
+          handleAttendanceChange
+        )
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'fire_detections' },
+          handleFireDetection
+        )
+        .on(
+          'postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'helmet_violations' },
+          handleHelmetViolation
+        )
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
     };
+
+    fetchDataAndSubscribe();
   }, []);
-  
+
+  const handleAttendanceChange = async (payload: any) => {
+    const log = payload.new as AttendanceLog;
+    
+    const { data: employee } = await supabase
+      .from('employees')
+      .select('name')
+      .eq('employee_id', log.employee_id)
+      .single();
+
+    if (employee) {
+      toast.success(
+        `${employee.name} ${
+          log.gesture_detected === 'thumb_up' ? 'checked in' : 'checked out'
+        }`,
+        {
+          icon: log.gesture_detected === 'thumb_up' ? '👍' : '👋',
+          position: 'bottom-right',
+        }
+      );
+    }
+  };
+
+  const handleFireDetection = (payload: any) => {
+    const log = payload.new as FireDetectionLog;
+    const camera = camerasRef.current.find(c => c.camera_id === log.camera_id);
+    
+    if (log.detected === 'Fire detected' && camera) {
+      toast.error(`Fire detected in ${camera.name}`, {
+        icon: '🔥',
+        position: 'bottom-right',
+      });
+    }
+  };
+
+  const handleHelmetViolation = (payload: any) => {
+    const log = payload.new as HelmetViolationLog;
+    const camera = camerasRef.current.find(c => c.camera_id === log.camera_id);
+    
+    if (log.detected === 'No helmet detected' && camera) {
+      toast.error(`Helmet violation in ${camera.name}`, {
+        icon: '⛑️',
+        position: 'bottom-right',
+      });
+    }
+  };
 
   const fetchModels = async () => {
     const { data, error } = await supabase.from('models').select('*');
     if (!error) setModels(data || []);
   };
-
-  const handleModelControl = async (action: 'start' | 'stop') => {
-    try {
-      setIsLoading(true);
-
-      // Get the session for authentication
-      const { data: { session } } = await supabase.auth.getSession();
-
-      const response = await fetch('http://localhost:8000/model-control', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.access_token || ''}`,
-        },
-        body: JSON.stringify({
-          camera_id: selectedCamera,
-          model_id: selectedModel,
-          action,
-        }),
-      });
-
-      if (!response.ok) {
-        // Try to parse error message from response
-        let errorData;
-        try {
-          errorData = await response.json();
-        } catch (e) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-      }
-
-      const responseData = await response.json(); // Get the response data
-
-      // Show toast message based on the response
-      if (responseData.message) {
-        toast.success(`Model ${action}ed successfully: ${responseData.message}`);
-      } else {
-        toast.success(`Model ${action}ed successfully`);
-      }
-    } catch (error) {
-      console.error('Error controlling model:', error);
-      toast.error(
-        `Failed to ${action} model: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  interface Camera {
-    camera_id: string;
-    name: string;
-    rtsp_url: string;
-    location: string;
-  }
-
-  const [cameras, setCameras] = useState<Camera[]>([]);
-  const [fullscreenCamera, setFullscreenCamera] = useState<string | null>(null);
-
-  useEffect(() => {
-    fetchCameras();
-  }, []);
 
   const fetchCameras = async () => {
     const { data, error } = await supabase
@@ -154,6 +145,79 @@ function CameraGrid() {
 
     if (data) {
       setCameras(data);
+    }
+  };
+
+  const handleModelControl = async (action: 'start' | 'stop') => {
+    try {
+      setIsLoading(true);
+  
+      // Validate model requirements before starting
+      if (action === 'start') {
+        const selectedModelObj = models.find(m => m.model_id === selectedModel);
+        
+        // Check if this is an attendance model
+        if (selectedModelObj?.type === 'attendance') {
+          // Verify there are registered employees
+          const { count, error } = await supabase
+            .from('employees')
+            .select('*', { count: 'exact', head: true });
+  
+          if (error) throw new Error('Failed to verify employee records');
+          if (count === 0) {
+            toast.error('No employees registered for attendance tracking');
+            return;
+          }
+        }
+      }
+  
+      const { data: { session } } = await supabase.auth.getSession();
+  
+      const response = await fetch('http://localhost:8000/model-control', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token || ''}`,
+        },
+        body: JSON.stringify({
+          camera_id: selectedCamera,
+          model_id: selectedModel,
+          action,
+        }),
+      });
+  
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        throw new Error(errorData?.error || `HTTP error! status: ${response.status}`);
+      }
+  
+      const responseData = await response.json();
+      const successMessage = responseData.message 
+        ? `Model ${action}ed successfully: ${responseData.message}`
+        : `Model ${action}ed successfully`;
+  
+      toast.success(successMessage, {
+        icon: action === 'start' ? '🚀' : '🛑',
+        position: 'bottom-right'
+      });
+  
+      // Refresh camera states after successful model control
+      if (action === 'stop') {
+        await fetchCameras();
+      }
+  
+    } catch (error) {
+      console.error('Error controlling model:', error);
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Failed to communicate with model service';
+      
+      toast.error(`Model control failed: ${errorMessage}`, {
+        icon: '❌',
+        position: 'bottom-right'
+      });
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -234,6 +298,7 @@ function CameraGrid() {
           </div>
         </div>
       </div>
+
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold text-gray-900">Camera Grid</h1>
         <span className="text-sm text-gray-500">
@@ -243,7 +308,9 @@ function CameraGrid() {
 
       <div
         className={`grid ${
-          fullscreenCamera ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'
+          fullscreenCamera
+            ? 'grid-cols-1'
+            : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3'
         } gap-6`}
       >
         {cameras.map((camera) => (
@@ -269,7 +336,11 @@ function CameraGrid() {
                 <button
                   onClick={() => toggleFullscreen(camera.camera_id)}
                   className="p-1 hover:bg-blue-100 rounded-full text-blue-500 transition-colors"
-                  title={fullscreenCamera === camera.camera_id ? 'Exit fullscreen' : 'Enter fullscreen'}
+                  title={
+                    fullscreenCamera === camera.camera_id
+                      ? 'Exit fullscreen'
+                      : 'Enter fullscreen'
+                  }
                 >
                   {fullscreenCamera === camera.camera_id ? (
                     <Minimize2 className="h-5 w-5" />
@@ -281,7 +352,9 @@ function CameraGrid() {
             </div>
             <div
               className={`relative ${
-                fullscreenCamera === camera.camera_id ? 'h-[calc(100vh-12rem)]' : 'aspect-video'
+                fullscreenCamera === camera.camera_id
+                  ? 'h-[calc(100vh-12rem)]'
+                  : 'aspect-video'
               }`}
             >
               <img
@@ -297,7 +370,9 @@ function CameraGrid() {
       {cameras.length === 0 && (
         <div className="text-center py-12">
           <p className="text-gray-500 text-lg">No cameras found</p>
-          <p className="text-gray-400 mt-2">Add cameras from the "Add Camera" page</p>
+          <p className="text-gray-400 mt-2">
+            Add cameras from the "Add Camera" page
+          </p>
         </div>
       )}
     </div>

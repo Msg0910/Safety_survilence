@@ -207,11 +207,11 @@ function Employees() {
       if (!capturedImage) {
         throw new Error("No captured image available");
       }
-
+  
       const blob = await fetch(capturedImage).then((r) => r.blob());
       const formData = new FormData();
       formData.append("image", blob, "face.jpg");
-
+  
       const response = await fetch(
         "http://localhost:8000/generate_face_encoding",
         {
@@ -219,27 +219,19 @@ function Employees() {
           body: formData,
         }
       );
-
-      // Use response.json() directly instead of response.text()
+  
       const data = await response.json();
-
+  
       if (!response.ok) {
         throw new Error(data.error || "Face encoding failed");
       }
-
-      // Convert base64 to Uint8Array
-      const base64Data = data.face_encoding;
-      const binaryStr = atob(base64Data);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-
+  
+      // Directly use the base64 string from the response
       setFormData((prev) => ({
         ...prev,
-        face_encoding: Array.from(bytes).join(","),
+        face_encoding: data.face_encoding, // Store base64 string directly
       }));
-
+  
       toast.success("Face encoding generated successfully");
     } catch (error) {
       console.error("Error generating face encoding:", error);
@@ -272,7 +264,7 @@ function Employees() {
         setFaceDetectedImage(null);
         setFormData((prev) => ({
           ...prev,
-          face_encoding: "",
+          face_encoding: ''  // Initialize with an empty string
         }));
       }
     };
